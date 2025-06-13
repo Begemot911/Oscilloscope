@@ -1,6 +1,6 @@
 import matplotlib
 
-matplotlib.use('TkAgg')
+#matplotlib.use('TkAgg')
 from matplotlib.backend_bases import MouseEvent
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -419,6 +419,7 @@ class Oscilloscope:
                     print("Read error:", e)
 
     def apply_filter(self, values):
+
         filter_type = self.filter_combo.get()
         filtered = []
 
