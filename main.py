@@ -1,6 +1,5 @@
 import matplotlib
-
-#matplotlib.use('TkAgg')
+matplotlib.use('TkAgg')
 from matplotlib.backend_bases import MouseEvent
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -15,6 +14,8 @@ import pandas as pd
 import queue
 import threading
 import struct
+import neurokit2 as nk
+from scipy.signal import find_peaks
 
 
 class Oscilloscope:
@@ -33,10 +34,9 @@ class Oscilloscope:
                 'color': ['blue', 'green', 'red', 'purple'][i],
                 'raw_data': deque(maxlen=self.buffer_size),
                 'filtered_data': deque(maxlen=self.buffer_size),
-                # Состояния для фильтров высокого порядка
-                'lpf_states': None,  # Для LPF
-                'hpf_states': None,  # Для HPF
-                'bpf_sections': None  # Для BPF
+                'lpf_states': None,
+                'hpf_states': None,
+                'bpf_sections': None
             })
         self.timestamps = deque(maxlen=self.buffer_size)
         self.start_time = None
@@ -59,7 +59,6 @@ class Oscilloscope:
         master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def on_close(self):
-        """Обработчик закрытия главного окна"""
         self.stop()
         self.master.destroy()
 
@@ -102,6 +101,22 @@ class Oscilloscope:
         ttk.Label(patient_frame, text="Диагноз:").grid(row=5, column=0, sticky=tk.W)
         self.diagnosis_entry = ttk.Entry(patient_frame)
         self.diagnosis_entry.grid(row=5, column=1, sticky=tk.EW, padx=5, pady=2)
+
+        # Кнопка анализа ЭКГ
+        self.analyze_btn = ttk.Button(left_info_panel, text="Анализ ЭКГ", command=self.analyze_ecg)
+        self.analyze_btn.pack(pady=10, fill=tk.X)
+
+        # Добавляем текстовое поле для результатов
+        results_frame = ttk.LabelFrame(left_info_panel, text="Результаты анализа")
+        results_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+
+        self.result_text = tk.Text(results_frame, height=10, wrap=tk.WORD, width=40)  # 40 символов в ширину
+        scrollbar = ttk.Scrollbar(results_frame, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_text.pack(fill=tk.BOTH, expand=False)
 
         # Переносим остальные элементы управления в правую панель
         self.notebook = ttk.Notebook(right_panel)
@@ -154,13 +169,11 @@ class Oscilloscope:
         self.filter_combo.pack(side=tk.LEFT)
         self.filter_combo.bind("<<ComboboxSelected>>", self.update_filter_ui)
 
-        # Добавляем выбор порядка фильтра
         ttk.Label(left_panel, text="Order:").pack(side=tk.LEFT, padx=(10, 0))
         self.filter_order_combo = ttk.Combobox(left_panel, values=[1, 2, 4], width=3)
-        self.filter_order_combo.current(0)  # Порядок 1 по умолчанию
+        self.filter_order_combo.current(0)
         self.filter_order_combo.pack(side=tk.LEFT)
 
-        # Фрейм для стандартного cutoff (LPF/HPF)
         self.std_cutoff_frame = ttk.Frame(left_panel)
         self.std_cutoff_label = ttk.Label(self.std_cutoff_frame, text="Cutoff (Hz):")
         self.std_cutoff_label.pack(side=tk.LEFT)
@@ -169,7 +182,6 @@ class Oscilloscope:
         self.std_cutoff_entry.pack(side=tk.LEFT)
         self.std_cutoff_frame.pack(side=tk.LEFT)
 
-        # Фрейм для BPF cutoff (нижний и верхний)
         self.bpf_cutoff_frame = ttk.Frame(left_panel)
         self.bpf_low_label = ttk.Label(self.bpf_cutoff_frame, text="Low:")
         self.bpf_low_label.pack(side=tk.LEFT)
@@ -191,6 +203,105 @@ class Oscilloscope:
         self.pause_btn = ttk.Button(right_panel, text="⏸ Stop", command=self.toggle_pause)
         self.pause_btn.pack(side=tk.RIGHT, padx=5)
         self.pause_btn.state(['disabled'])
+
+    def analyze_ecg(self):
+        """Анализ ЭКГ сигнала с корректной визуализацией"""
+        # Закрываем все предыдущие графики
+        plt.close('all')
+
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv")],
+            title="Выберите файл с ЭКГ данными"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # Загрузка данных
+            df = pd.read_excel(file_path)
+
+            # Проверка наличия нужных столбцов
+            required_columns = ['Time (s)', 'Ch1_Filtered']
+            if not all(col in df.columns for col in required_columns):
+                missing = [col for col in required_columns if col not in df.columns]
+                messagebox.showerror("Ошибка", f"Отсутствуют необходимые столбцы: {', '.join(missing)}")
+                return
+
+            time_data = df['Time (s)'].values
+            ecg_signal = df['Ch1_Filtered'].values
+
+            # Проверка минимальной длины сигнала
+            min_length = 250
+            if len(ecg_signal) < min_length:
+                messagebox.showwarning("Предупреждение",
+                                       f"Слишком короткая запись ЭКГ. Минимум {min_length} точек, получено {len(ecg_signal)}")
+                return
+
+            # Оценка частоты дискретизации
+            sampling_rate = 1 / np.mean(np.diff(time_data)) if len(time_data) > 1 else 250
+
+            # Фильтрация сигнала для лучшего анализа
+            ecg_filtered = nk.ecg_clean(ecg_signal, sampling_rate=sampling_rate)
+
+            # Детекция R-пиков
+            try:
+                _, rpeaks = nk.ecg_peaks(ecg_filtered, sampling_rate=sampling_rate)
+                peaks = rpeaks['ECG_R_Peaks']
+
+                if len(peaks) < 2:
+                    messagebox.showwarning("Предупреждение",
+                                           f"Обнаружено только {len(peaks)} R-пиков. Необходимо минимум 2 для анализа.")
+                    return
+            except Exception as e:
+                messagebox.showerror("Ошибка детекции", f"Не удалось обнаружить R-пики: {str(e)}")
+                return
+
+            # Расчет показателей
+            rr_intervals = np.diff(peaks) / sampling_rate
+            heart_rate = 60 / np.mean(rr_intervals)
+
+            # Подготовка текста с результатами
+            result_text = (
+                "=== Результаты анализа ЭКГ ===\n\n"
+                f"Длительность записи: {time_data[-1] - time_data[0]:.1f} сек\n"
+                f"Частота дискретизации: {sampling_rate:.1f} Гц\n"
+                f"Общее количество точек: {len(ecg_signal)}\n"
+                f"Обнаружено R-пиков: {len(peaks)}\n"
+                f"Средняя ЧСС: {heart_rate:.1f} уд/мин\n"
+                f"Диапазон ЧСС: {60 / rr_intervals.max():.1f}-{60 / rr_intervals.min():.1f} уд/мин\n\n"
+            )
+
+            # Проверка аритмии
+            if np.std(rr_intervals) > 0.1:
+                result_text += "ВНИМАНИЕ: Обнаружена возможная аритмия (высокая вариабельность RR-интервалов)\n"
+
+            # Очистка и вывод результатов
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, result_text)
+
+            # Создаем отдельное окно для графика ЭКГ
+            ecg_fig = plt.figure("Анализ ЭКГ", figsize=(12, 6))
+
+            # Основной график ЭКГ
+            ax = ecg_fig.add_subplot(111)
+            ax.plot(time_data, ecg_filtered, label='Фильтрованный ЭКГ сигнал')
+            ax.scatter(time_data[peaks], ecg_filtered[peaks], color='red', label='R-пики')
+
+            # Настройки графика
+            ax.set_title(f"ЭКГ анализ (ЧСС: {heart_rate:.1f} уд/мин)")
+            ax.set_xlabel("Время (с)")
+            ax.set_ylabel("Амплитуда")
+            ax.legend()
+            ax.grid(True)
+
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            messagebox.showerror("Ошибка анализа", f"Не удалось проанализировать ЭКГ:\n{str(e)}")
+            plt.close('all')
+
 
     def setup_plots(self):
         time_frame = self.notebook.winfo_children()[0]
