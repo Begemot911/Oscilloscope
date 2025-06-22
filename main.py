@@ -1,4 +1,5 @@
 import matplotlib
+
 matplotlib.use('TkAgg')
 from matplotlib.backend_bases import MouseEvent
 import tkinter as tk
@@ -16,10 +17,12 @@ import threading
 import struct
 import neurokit2 as nk
 from scipy.signal import find_peaks
+from crc import Calculator, Crc8
 
 
 class Oscilloscope:
     def __init__(self, master):
+        self.crc_calculator = Calculator(Crc8.CCITT)
         self.after_id = None
         self.master = master
         self.ser = None
@@ -27,21 +30,19 @@ class Oscilloscope:
         self.paused = False
         self.buffer_size = 5000
         self.total_points = 0
-        self.num_channels = 4
+        self.num_channels = 2  # Now we have 2 channels from Arduino
         self.channels = []
         for i in range(self.num_channels):
             self.channels.append({
                 'color': ['blue', 'green', 'red', 'purple'][i],
                 'raw_data': deque(maxlen=self.buffer_size),
                 'filtered_data': deque(maxlen=self.buffer_size),
+                'timestamps': deque(maxlen=self.buffer_size),  # Separate timestamps for each channel
                 'lpf_states': None,
                 'hpf_states': None,
                 'bpf_sections': None
             })
-        self.timestamps = deque(maxlen=self.buffer_size)
         self.start_time = None
-        self.sample_rate = 853.0
-        self.sample_period = 1.0 / self.sample_rate
         self.data_queue = queue.Queue()
         self.filter_params = {
             'type': 'None',
@@ -110,8 +111,7 @@ class Oscilloscope:
         results_frame = ttk.LabelFrame(left_info_panel, text="Результаты анализа")
         results_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
-
-        self.result_text = tk.Text(results_frame, height=10, wrap=tk.WORD, width=40)  # 40 символов в ширину
+        self.result_text = tk.Text(results_frame, height=10, wrap=tk.WORD, width=40)
         scrollbar = ttk.Scrollbar(results_frame, command=self.result_text.yview)
         self.result_text.configure(yscrollcommand=scrollbar.set)
 
@@ -150,13 +150,7 @@ class Oscilloscope:
         self.connect_btn = ttk.Button(left_panel, text="Connect", command=self.toggle_connection)
         self.connect_btn.pack(side=tk.LEFT, padx=10)
 
-        # Sample settings
-        ttk.Label(left_panel, text="Rate (Hz):").pack(side=tk.LEFT)
-        self.rate_entry = ttk.Entry(left_panel, width=8)
-        self.rate_entry.insert(0, "533")
-        self.rate_entry.pack(side=tk.LEFT)
-        self.rate_entry.bind("<FocusOut>", self.update_sample_rate)
-
+        # Sample settings (removed rate entry since we get timestamps from Arduino)
         ttk.Label(left_panel, text="Points:").pack(side=tk.LEFT)
         self.points_entry = ttk.Entry(left_panel, width=8)
         self.points_entry.insert(0, "1000")
@@ -206,7 +200,6 @@ class Oscilloscope:
 
     def analyze_ecg(self):
         """Анализ ЭКГ сигнала с корректной визуализацией"""
-        # Закрываем все предыдущие графики
         plt.close('all')
 
         file_path = filedialog.askopenfilename(
@@ -218,10 +211,8 @@ class Oscilloscope:
             return
 
         try:
-            # Загрузка данных
             df = pd.read_excel(file_path)
 
-            # Проверка наличия нужных столбцов
             required_columns = ['Time (s)', 'Ch1_Filtered']
             if not all(col in df.columns for col in required_columns):
                 missing = [col for col in required_columns if col not in df.columns]
@@ -231,20 +222,20 @@ class Oscilloscope:
             time_data = df['Time (s)'].values
             ecg_signal = df['Ch1_Filtered'].values
 
-            # Проверка минимальной длины сигнала
             min_length = 250
             if len(ecg_signal) < min_length:
                 messagebox.showwarning("Предупреждение",
                                        f"Слишком короткая запись ЭКГ. Минимум {min_length} точек, получено {len(ecg_signal)}")
                 return
 
-            # Оценка частоты дискретизации
-            sampling_rate = 1 / np.mean(np.diff(time_data)) if len(time_data) > 1 else 250
+            # Calculate sampling rate from timestamps
+            if len(time_data) > 1:
+                sampling_rate = 1 / np.mean(np.diff(time_data))
+            else:
+                sampling_rate = 250
 
-            # Фильтрация сигнала для лучшего анализа
             ecg_filtered = nk.ecg_clean(ecg_signal, sampling_rate=sampling_rate)
 
-            # Детекция R-пиков
             try:
                 _, rpeaks = nk.ecg_peaks(ecg_filtered, sampling_rate=sampling_rate)
                 peaks = rpeaks['ECG_R_Peaks']
@@ -257,11 +248,9 @@ class Oscilloscope:
                 messagebox.showerror("Ошибка детекции", f"Не удалось обнаружить R-пики: {str(e)}")
                 return
 
-            # Расчет показателей
             rr_intervals = np.diff(peaks) / sampling_rate
             heart_rate = 60 / np.mean(rr_intervals)
 
-            # Подготовка текста с результатами
             result_text = (
                 "=== Результаты анализа ЭКГ ===\n\n"
                 f"Длительность записи: {time_data[-1] - time_data[0]:.1f} сек\n"
@@ -272,23 +261,18 @@ class Oscilloscope:
                 f"Диапазон ЧСС: {60 / rr_intervals.max():.1f}-{60 / rr_intervals.min():.1f} уд/мин\n\n"
             )
 
-            # Проверка аритмии
             if np.std(rr_intervals) > 0.1:
                 result_text += "ВНИМАНИЕ: Обнаружена возможная аритмия (высокая вариабельность RR-интервалов)\n"
 
-            # Очистка и вывод результатов
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, result_text)
 
-            # Создаем отдельное окно для графика ЭКГ
             ecg_fig = plt.figure("Анализ ЭКГ", figsize=(12, 6))
 
-            # Основной график ЭКГ
             ax = ecg_fig.add_subplot(111)
             ax.plot(time_data, ecg_filtered, label='Фильтрованный ЭКГ сигнал')
             ax.scatter(time_data[peaks], ecg_filtered[peaks], color='red', label='R-пики')
 
-            # Настройки графика
             ax.set_title(f"ЭКГ анализ (ЧСС: {heart_rate:.1f} уд/мин)")
             ax.set_xlabel("Время (с)")
             ax.set_ylabel("Амплитуда")
@@ -301,7 +285,6 @@ class Oscilloscope:
         except Exception as e:
             messagebox.showerror("Ошибка анализа", f"Не удалось проанализировать ЭКГ:\n{str(e)}")
             plt.close('all')
-
 
     def setup_plots(self):
         time_frame = self.notebook.winfo_children()[0]
@@ -378,18 +361,6 @@ class Oscilloscope:
             self.bpf_cutoff_frame.pack_forget()
             self.std_cutoff_frame.pack(side=tk.LEFT)
 
-    def update_sample_rate(self, event=None):
-        try:
-            new_rate = float(self.rate_entry.get())
-            if new_rate <= 0:
-                raise ValueError
-            self.sample_rate = new_rate
-            self.sample_period = 1.0 / self.sample_rate
-        except:
-            messagebox.showerror("Error", "Invalid sample rate value!")
-            self.rate_entry.delete(0, tk.END)
-            self.rate_entry.insert(0, str(self.sample_rate))
-
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
         self.port_combo['values'] = ports
@@ -409,7 +380,6 @@ class Oscilloscope:
                 self.ser.reset_input_buffer()
             self.paused = False
             self.pause_btn.config(text="⏸ Stop")
-            self.start_time = time.time()
         else:
             self.paused = True
             self.pause_time = time.time()
@@ -417,13 +387,12 @@ class Oscilloscope:
 
     def _reset_measurement(self):
         self.total_points = 0
-        self.timestamps.clear()
         self.data_queue.queue.clear()
 
         for ch in self.channels:
             ch['raw_data'].clear()
             ch['filtered_data'].clear()
-            # Сбрасываем состояния фильтров
+            ch['timestamps'].clear()
             ch['lpf_states'] = None
             ch['hpf_states'] = None
             ch['bpf_sections'] = None
@@ -437,13 +406,11 @@ class Oscilloscope:
             self.buffer = bytearray()
             self.stop()
             self.total_points = 0
-            self.timestamps.clear()
-
-            self.buffer = bytearray()
 
             for ch in self.channels:
                 ch['raw_data'].clear()
                 ch['filtered_data'].clear()
+                ch['timestamps'].clear()
                 ch['lpf_states'] = None
                 ch['hpf_states'] = None
                 ch['bpf_sections'] = None
@@ -459,7 +426,6 @@ class Oscilloscope:
             self.pause_btn.state(['!disabled'])
             self.export_btn.state(['!disabled'])
             self.connect_btn.config(text="Disconnect")
-            self.start_time = time.time()
 
             for line in self.lines:
                 line.set_data([], [])
@@ -473,9 +439,8 @@ class Oscilloscope:
             messagebox.showerror("Connection Error", str(e))
 
     def read_from_port(self):
-        HEADER1 = 0xAA
-        HEADER2 = 0x55
-        PACKET_SIZE = 19
+        PACKET_HEADER = 0xAA
+        PACKET_SIZE = 11  # 1(header) + 1(channel) + 4(time) + 4(value) + 1(CRC)
 
         while self.is_running:
             if self.ser and self.ser.in_waiting:
@@ -484,149 +449,142 @@ class Oscilloscope:
                     self.buffer.extend(raw_data)
 
                     while len(self.buffer) >= PACKET_SIZE:
-                        start_idx = -1
-                        for i in range(len(self.buffer) - 1):
-                            if self.buffer[i] == HEADER1 and self.buffer[i + 1] == HEADER2:
-                                start_idx = i
-                                break
-
-                        if start_idx < 0:
-                            self.buffer.clear()
-                            break
-
-                        if len(self.buffer) - start_idx < PACKET_SIZE:
-                            del self.buffer[:start_idx]
-                            break
-
-                        packet = self.buffer[start_idx:start_idx + PACKET_SIZE]
-                        del self.buffer[:start_idx + PACKET_SIZE]
-
-                        if packet[0] != HEADER1 or packet[1] != HEADER2:
+                        if self.buffer[0] != PACKET_HEADER:
+                            del self.buffer[0]
                             continue
 
-                        data_part = packet[2:18]
-                        received_checksum = packet[18]
+                        packet = bytes(self.buffer[:PACKET_SIZE])
 
-                        computed_checksum = 0
-                        for byte in packet[:18]:
-                            computed_checksum ^= byte
+                        # Проверяем CRC (первые 9 байт)
+                        computed_crc = self.crc_calculator.checksum(packet[:10])
 
-                        if computed_checksum != received_checksum:
-                            print(f"CRC error: {computed_checksum} vs {received_checksum}")
+                        if computed_crc != packet[10]:
+                            print(f"CRC error: {computed_crc} != {packet[10]}")
+                            del self.buffer[0]
                             continue
 
-                        try:
-                            int_values = struct.unpack('<4i', data_part)
-                            #'<4i' для 4 целых чисел(int32) '<4f' для 4 чисел с плавающей точкой(float32)
-                            values = [float(val) for val in int_values]
-                            self.data_queue.put(values)
-                        except struct.error as e:
-                            print(f"Unpack error: {e}")
+                        # Извлекаем данные
+                        channel = packet[1]
+                        timestamp = struct.unpack('<f', packet[2:6])[0]
 
-                    if len(self.buffer) > 1024:
-                        self.buffer = bytearray()
+                        # Значение - только 3 байта (6,7,8), так как 9-й байт - это CRC!
+                        value = struct.unpack('<f', packet[6:10])[0]
+
+                        #print(f"Raw packet: {[f'0x{b:02x}' for b in packet]}")
+                        #print(f"Value bytes (correct): {[f'0x{b:02x}' for b in packet[6:10]]}")
+                        #print(f"Received: channel={channel}, time={timestamp:.3f}, value={value}")
+
+                        self.data_queue.put((channel, timestamp, value))
+                        del self.buffer[:PACKET_SIZE]
 
                 except Exception as e:
-                    print("Read error:", e)
+                    print(f"Error: {str(e)}")
+                    self.buffer.clear()
 
-    def apply_filter(self, values):
-
+    def apply_filter(self, value, channel_idx):
         filter_type = self.filter_combo.get()
-        filtered = []
-
         try:
             order = int(self.filter_order_combo.get())
         except:
             order = 1
 
-        for i, value in enumerate(values):
-            ch = self.channels[i]
+        ch = self.channels[channel_idx]
 
-            if filter_type == 'LPF':
-                try:
-                    cutoff = float(self.std_cutoff_entry.get())
-                except:
-                    cutoff = 50.0
+        if filter_type == 'LPF':
+            try:
+                cutoff = float(self.std_cutoff_entry.get())
+            except:
+                cutoff = 50.0
 
-                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff / self.sample_rate))
-
-                # Инициализация состояний при необходимости
-                if ch['lpf_states'] is None or len(ch['lpf_states']) != order:
-                    ch['lpf_states'] = [0.0] * order
-
-                # Применение каскада фильтров
-                current_value = value
-                for j in range(order):
-                    state = ch['lpf_states'][j]
-                    filtered_val = alpha * current_value + (1 - alpha) * state
-                    ch['lpf_states'][j] = filtered_val
-                    current_value = filtered_val
-
-                filtered.append(filtered_val)
-
-            elif filter_type == 'HPF':
-                try:
-                    cutoff = float(self.std_cutoff_entry.get())
-                except:
-                    cutoff = 50.0
-
-                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff / self.sample_rate))
-
-                # Инициализация состояний при необходимости
-                if ch['hpf_states'] is None or len(ch['hpf_states']) != order:
-                    ch['hpf_states'] = [{'state': 0.0, 'prev_input': 0.0} for _ in range(order)]
-
-                # Применение каскада фильтров
-                current_value = value
-                for j in range(order):
-                    state_dict = ch['hpf_states'][j]
-                    hp = alpha * (state_dict['state'] + current_value - state_dict['prev_input'])
-                    state_dict['state'] = hp
-                    state_dict['prev_input'] = current_value
-                    current_value = hp
-
-                filtered.append(hp)
-
-            elif filter_type == 'BPF':
-                try:
-                    cutoff_low = float(self.bpf_low_entry.get())
-                    cutoff_high = float(self.bpf_high_entry.get())
-                except:
-                    cutoff_low = 20.0
-                    cutoff_high = 100.0
-
-                if cutoff_low > cutoff_high:
-                    cutoff_low, cutoff_high = cutoff_high, cutoff_low
-
-                alpha_low = 1 / (1 + 1 / (2 * np.pi * cutoff_low / self.sample_rate))
-                alpha_high = 1 / (1 + 1 / (2 * np.pi * cutoff_high / self.sample_rate))
-
-                # Инициализация секций при необходимости
-                if ch['bpf_sections'] is None or len(ch['bpf_sections']) != order:
-                    ch['bpf_sections'] = [{'lpf': 0.0, 'hpf': 0.0, 'prev_lpf': 0.0} for _ in range(order)]
-
-                # Применение каскада секций BPF
-                current_value = value
-                for j in range(order):
-                    section = ch['bpf_sections'][j]
-
-                    # LPF часть
-                    lpf_val = alpha_high * current_value + (1 - alpha_high) * section['lpf']
-                    section['lpf'] = lpf_val
-
-                    # HPF часть
-                    hpf_val = alpha_low * (section['hpf'] + lpf_val - section['prev_lpf'])
-                    section['hpf'] = hpf_val
-                    section['prev_lpf'] = lpf_val
-
-                    current_value = hpf_val
-
-                filtered.append(hpf_val)
-
+            # Calculate alpha based on time difference from previous sample
+            if len(ch['timestamps']) > 0:
+                time_diff = ch['timestamps'][-1] - ch['timestamps'][-2] if len(ch['timestamps']) > 1 else 0.001
+                if time_diff <= 0:
+                    time_diff = 0.001
+                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff * time_diff))
             else:
-                filtered.append(value)
+                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff * 0.001))
 
-        return filtered
+            if ch['lpf_states'] is None or len(ch['lpf_states']) != order:
+                ch['lpf_states'] = [0.0] * order
+
+            current_value = value
+            for j in range(order):
+                state = ch['lpf_states'][j]
+                filtered_val = alpha * current_value + (1 - alpha) * state
+                ch['lpf_states'][j] = filtered_val
+                current_value = filtered_val
+
+            return filtered_val
+
+        elif filter_type == 'HPF':
+            try:
+                cutoff = float(self.std_cutoff_entry.get())
+            except:
+                cutoff = 50.0
+
+            if len(ch['timestamps']) > 0:
+                time_diff = ch['timestamps'][-1] - ch['timestamps'][-2] if len(ch['timestamps']) > 1 else 0.001
+                if time_diff <= 0:
+                    time_diff = 0.001
+                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff * time_diff))
+            else:
+                alpha = 1 / (1 + 1 / (2 * np.pi * cutoff * 0.001))
+
+            if ch['hpf_states'] is None or len(ch['hpf_states']) != order:
+                ch['hpf_states'] = [{'state': 0.0, 'prev_input': 0.0} for _ in range(order)]
+
+            current_value = value
+            for j in range(order):
+                state_dict = ch['hpf_states'][j]
+                hp = alpha * (state_dict['state'] + current_value - state_dict['prev_input'])
+                state_dict['state'] = hp
+                state_dict['prev_input'] = current_value
+                current_value = hp
+
+            return hp
+
+        elif filter_type == 'BPF':
+            try:
+                cutoff_low = float(self.bpf_low_entry.get())
+                cutoff_high = float(self.bpf_high_entry.get())
+            except:
+                cutoff_low = 20.0
+                cutoff_high = 100.0
+
+            if cutoff_low > cutoff_high:
+                cutoff_low, cutoff_high = cutoff_high, cutoff_low
+
+            if len(ch['timestamps']) > 0:
+                time_diff = ch['timestamps'][-1] - ch['timestamps'][-2] if len(ch['timestamps']) > 1 else 0.001
+                if time_diff <= 0:
+                    time_diff = 0.001
+                alpha_low = 1 / (1 + 1 / (2 * np.pi * cutoff_low * time_diff))
+                alpha_high = 1 / (1 + 1 / (2 * np.pi * cutoff_high * time_diff))
+            else:
+                alpha_low = 1 / (1 + 1 / (2 * np.pi * cutoff_low * 0.001))
+                alpha_high = 1 / (1 + 1 / (2 * np.pi * cutoff_high * 0.001))
+
+            if ch['bpf_sections'] is None or len(ch['bpf_sections']) != order:
+                ch['bpf_sections'] = [{'lpf': 0.0, 'hpf': 0.0, 'prev_lpf': 0.0} for _ in range(order)]
+
+            current_value = value
+            for j in range(order):
+                section = ch['bpf_sections'][j]
+
+                lpf_val = alpha_high * current_value + (1 - alpha_high) * section['lpf']
+                section['lpf'] = lpf_val
+
+                hpf_val = alpha_low * (section['hpf'] + lpf_val - section['prev_lpf'])
+                section['hpf'] = hpf_val
+                section['prev_lpf'] = lpf_val
+
+                current_value = hpf_val
+
+            return hpf_val
+
+        else:
+            return value
 
     def update_plot(self):
         if self.is_running and not self.paused:
@@ -634,52 +592,68 @@ class Oscilloscope:
                 max_points = 200
                 processed = 0
 
+                # Собираем новые данные из очереди
                 while not self.data_queue.empty() and processed < max_points:
-                    raw_values = self.data_queue.get_nowait()
-                    current_time = self.total_points * self.sample_period
+                    try:
+                        data = self.data_queue.get_nowait()
+                        if len(data) != 3:  # Проверяем структуру данных
+                            continue
 
-                    self.total_points += 1
+                        channel_idx, timestamp, value = data
+                        channel_idx -= 1  # Каналы нумеруются с 1 в Arduino
 
-                    filtered_values = self.apply_filter(raw_values)
+                        if 0 <= channel_idx < self.num_channels:
+                            ch = self.channels[channel_idx]
+                            ch['raw_data'].append(value)
+                            ch['timestamps'].append(timestamp)
+                            ch['filtered_data'].append(self.apply_filter(value, channel_idx))
+                            processed += 1
+                    except Exception as e:
+                        print(f"Error processing data: {e}")
+                        continue
 
-                    self.timestamps.append(current_time)
-                    for i in range(self.num_channels):
-                        self.channels[i]['raw_data'].append(raw_values[i])
-                        self.channels[i]['filtered_data'].append(filtered_values[i])
-                    processed += 1
+                # Определяем сколько точек показывать
+                try:
+                    points_to_show = int(self.points_entry.get())
+                except ValueError:
+                    points_to_show = 1000  # Значение по умолчанию
 
-                points_to_show = min(int(self.points_entry.get()), len(self.timestamps))
-                if points_to_show > 0:
-                    time_axis = np.array(self.timestamps)[-points_to_show:]
+                for i, ax in enumerate(self.axes):
+                    ch = self.channels[i]
 
-                    for i, ax in enumerate(self.axes):
-                        data_axis = np.array(self.channels[i]['filtered_data'])[-points_to_show:]
-                        self.lines[i].set_data(time_axis, data_axis)
+                    # Преобразуем в numpy array перед срезом
+                    time_array = np.array(ch['timestamps'])
+                    data_array = np.array(ch['filtered_data'])
 
-                        ax.relim()
-                        ax.autoscale_view(scalex=False, scaley=True)
+                    # Берем последние N точек
+                    start_idx = max(0, len(time_array) - points_to_show)
+                    time_axis = time_array[start_idx:]
+                    data_axis = data_array[start_idx:]
 
+                    # Обновляем данные на графике
+                    self.lines[i].set_data(time_axis, data_axis)
+
+                    # Настраиваем масштаб
                     if len(time_axis) > 1:
-                        x_min = max(0, time_axis[0])
-                        x_max = time_axis[-1] + 0.1 * (time_axis[-1] - time_axis[0])
-                        if x_min == x_max:
-                            x_min -= 0.1
-                            x_max += 0.1
-                    elif len(time_axis) == 1:
-                        x_min = time_axis[0] - 0.5
-                        x_max = time_axis[0] + 0.5
-                    else:
-                        x_min, x_max = 0, 1
+                        ax.relim()
+                        ax.autoscale_view(scalex=True, scaley=True)
 
-                    for ax in self.axes:
-                        ax.set_xlim(x_min, x_max)
+                        # Устанавливаем пределы по X
+                        ax.set_xlim(time_axis[0], time_axis[-1])
 
-                    self.canvas_time.draw()
+                        # Добавляем небольшой отступ по Y
+                        y_min, y_max = np.min(data_axis), np.max(data_axis)
+                        y_margin = max(0.1 * (y_max - y_min), 0.5)
+                        ax.set_ylim(y_min - y_margin, y_max + y_margin)
+
+                self.canvas_time.draw()
 
             except Exception as e:
                 print(f"Update error: {e}")
+                import traceback
+                traceback.print_exc()
 
-        self.after_id = self.master.after(5, self.update_plot)
+        self.after_id = self.master.after(20, self.update_plot)
 
     def increase_scale(self, event=None):
         for ax in self.axes:
@@ -704,7 +678,6 @@ class Oscilloscope:
                 "Пол": self.gender_combo.get(),
                 "Год рождения": self.birth_year_entry.get(),
                 "Диагноз": self.diagnosis_entry.get(),
-                "Частота дискретизации (Гц)": self.sample_rate,
                 "Дата записи": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
@@ -716,19 +689,21 @@ class Oscilloscope:
                 messagebox.showerror("Error", "Invalid points value! Please enter a positive integer.")
                 return
 
-            if not self.timestamps:
-                messagebox.showwarning("No Data", "There is no data to export.")
-                return
+            # Find the minimum available points across all channels
+            points_available = min(points_to_save,
+                                   min(len(ch['timestamps']) for ch in self.channels if len(ch['timestamps']) > 0))
 
-            points_available = min(points_to_save, len(self.timestamps))
             if points_available == 0:
                 messagebox.showwarning("No Data", "There is no data to export.")
                 return
 
-            data_dict = {'Time (s)': list(self.timestamps)[-points_available:]}
-            for i in range(self.num_channels):
-                data_dict[f'Ch{i + 1}_Raw'] = list(self.channels[i]['raw_data'])[-points_available:]
-                data_dict[f'Ch{i + 1}_Filtered'] = list(self.channels[i]['filtered_data'])[-points_available:]
+            # Create a DataFrame with timestamps and data for each channel
+            data_dict = {}
+            for i, ch in enumerate(self.channels):
+                if len(ch['timestamps']) > 0:
+                    data_dict[f'Ch{i + 1}_Time'] = list(ch['timestamps'])[-points_available:]
+                    data_dict[f'Ch{i + 1}_Raw'] = list(ch['raw_data'])[-points_available:]
+                    data_dict[f'Ch{i + 1}_Filtered'] = list(ch['filtered_data'])[-points_available:]
 
             df_data = pd.DataFrame(data_dict)
             df_info = pd.DataFrame(list(patient_info.items()), columns=['Parameter', 'Value'])
@@ -814,16 +789,15 @@ class Oscilloscope:
             self.export_btn.state(['disabled'])
 
         self.data_queue.queue.clear()
-        self.timestamps.clear()
-        self.buffer = bytearray()
         for ch in self.channels:
             ch['raw_data'].clear()
             ch['filtered_data'].clear()
+            ch['timestamps'].clear()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.title("4-Channel Oscilloscope")
-    root.geometry("1200x800")
+    root.title("ECG Oscilloscope")
+    root.geometry("1500x800")
     app = Oscilloscope(root)
     root.mainloop()
