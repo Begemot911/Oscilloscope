@@ -20,28 +20,156 @@ from scipy.signal import find_peaks
 from crc import Calculator, Crc8
 
 
+class SerialReader:
+    def __init__(self, port, baudrate, data_queue, crc_calculator):
+        self.port = port
+        self.baudrate = baudrate
+        self.data_queue = data_queue
+        self.crc_calculator = crc_calculator
+        self.ser = None
+        self.is_running = False
+        self.thread = None
+        self.buffer = bytearray()
+        self.lock = threading.Lock()  # Добавляем блокировку для безопасного доступа
+
+    def start(self):
+        if self.is_running:
+            return False
+
+        try:
+            print(f"Connecting to {self.port} at {self.baudrate} baud...")
+            self.ser = serial.Serial(
+                self.port,
+                self.baudrate,
+                timeout=0.01
+            )
+            self.ser.reset_input_buffer()
+            self.is_running = True
+            self.thread = threading.Thread(target=self.read_from_port, daemon=True)
+            self.thread.start()
+            print(f"Successfully connected to {self.port}")
+            return True
+        except Exception as e:
+            print(f"Failed to connect to {self.port}: {str(e)}")
+            return False
+
+    def read_from_port(self):
+        PACKET_HEADER = 0xAA
+        PACKET_SIZE = 11
+
+        print(f"Starting data processing on {self.port}")
+
+        while self.is_running and self.ser and self.ser.is_open:
+            try:
+                # Читаем все доступные данные
+                bytes_to_read = self.ser.in_waiting
+                if bytes_to_read == 0:
+                    time.sleep(0.01)
+                    continue
+
+                raw_data = self.ser.read(bytes_to_read)
+                self.buffer.extend(raw_data)
+
+                # Обрабатываем все полные пакеты в буфере
+                while len(self.buffer) >= PACKET_SIZE:
+                    # Ищем начало пакета
+                    header_pos = -1
+                    for i in range(len(self.buffer) - PACKET_SIZE + 1):
+                        if self.buffer[i] == PACKET_HEADER:
+                            header_pos = i
+                            break
+
+                    # Если заголовок не найден, очищаем буфер
+                    if header_pos == -1:
+                        self.buffer.clear()
+                        break
+
+                    # Если заголовок не в начале, удаляем мусорные данные
+                    if header_pos > 0:
+                        print(f"{self.port}: Discarded {header_pos} bytes before header")
+                        del self.buffer[:header_pos]
+                        continue
+
+                    # Проверяем CRC
+                    packet = bytes(self.buffer[:PACKET_SIZE])
+                    computed_crc = self.crc_calculator.checksum(packet[:10])
+
+                    if computed_crc != packet[10]:
+                        print(f"{self.port}: CRC error, skipping packet")
+                        del self.buffer[:1]  # Пропускаем только 1 байт
+                        continue
+
+                    # Извлекаем данные
+                    channel = packet[1]
+                    timestamp = struct.unpack('<f', packet[2:6])[0]
+                    value = struct.unpack('<f', packet[6:10])[0]
+
+                    # Помещаем в очередь
+                    self.data_queue.put({
+                        'port': self.port,
+                        'channel': channel,
+                        'timestamp': timestamp,
+                        'value': value
+                    })
+
+                    # Удаляем обработанный пакет
+                    del self.buffer[:PACKET_SIZE]
+
+            except serial.SerialException as e:
+                print(f"{self.port}: Serial error - {str(e)}")
+                break
+            except Exception as e:
+                print(f"{self.port}: Processing error - {str(e)}")
+                time.sleep(0.1)
+
+        print(f"Stopped reading from {self.port}")
+
+    def stop(self):
+        with self.lock:
+            self.is_running = False
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)  # Ожидаем завершение потока
+
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+                print(f"Port {self.port} closed successfully")
+            except Exception as e:
+                print(f"Error closing port {self.port}: {str(e)}")
+
+        self.buffer.clear()
+        print(f"Port {self.port} fully stopped")
+
+
 class Oscilloscope:
     def __init__(self, master):
         self.crc_calculator = Calculator(Crc8.CCITT)
         self.after_id = None
         self.master = master
-        self.ser = None
+        self.serial_readers = []  # Список для хранения объектов SerialReader
         self.is_running = False
         self.paused = False
         self.buffer_size = 5000
         self.total_points = 0
-        self.num_channels = 2  # Now we have 2 channels from Arduino
+        self.num_channels = 10  # Теперь 10 каналов
         self.channels = []
+
+        # Цвета для 10 каналов
+        colors = ['blue', 'green', 'red', 'purple', 'orange',
+                  'cyan', 'magenta', 'yellow', 'brown', 'pink']
+
         for i in range(self.num_channels):
             self.channels.append({
-                'color': ['blue', 'green', 'red', 'purple'][i],
+                'color': colors[i % len(colors)],
                 'raw_data': deque(maxlen=self.buffer_size),
                 'filtered_data': deque(maxlen=self.buffer_size),
-                'timestamps': deque(maxlen=self.buffer_size),  # Separate timestamps for each channel
+                'timestamps': deque(maxlen=self.buffer_size),
                 'lpf_states': None,
                 'hpf_states': None,
                 'bpf_sections': None
             })
+
         self.start_time = None
         self.data_queue = queue.Queue()
         self.filter_params = {
@@ -60,8 +188,21 @@ class Oscilloscope:
         master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def on_close(self):
-        self.stop()
-        self.master.destroy()
+        print("Closing application...")
+        self.stop()  # Гарантированно останавливаем все процессы
+
+        # Дополнительная очистка, если нужна
+        try:
+            self.data_queue.queue.clear()
+            for ch in self.channels:
+                ch['raw_data'].clear()
+                ch['filtered_data'].clear()
+                ch['timestamps'].clear()
+        except:
+            pass
+
+        self.master.destroy()  # Закрываем окно
+        print("Application closed")
 
     def setup_gui(self):
         main_panel = ttk.PanedWindow(self.master, orient=tk.HORIZONTAL)
@@ -136,39 +277,57 @@ class Oscilloscope:
         right_panel = ttk.Frame(control_frame)
         right_panel.pack(side=tk.RIGHT)
 
-        # Port settings
-        ttk.Label(left_panel, text="Port:").pack(side=tk.LEFT)
-        self.port_combo = ttk.Combobox(left_panel, width=15)
-        self.port_combo.pack(side=tk.LEFT)
+        # Port settings - теперь для двух портов
+        ports_frame = ttk.Frame(left_panel)
+        ports_frame.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Label(left_panel, text="Baud:").pack(side=tk.LEFT, padx=(10, 0))
-        self.baud_combo = ttk.Combobox(left_panel, values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
+        # Первый порт
+        port1_frame = ttk.Frame(ports_frame)
+        port1_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(port1_frame, text="Port 1:").pack(side=tk.LEFT)
+        self.port1_combo = ttk.Combobox(port1_frame, width=15)
+        self.port1_combo.pack(side=tk.LEFT)
+
+        # Второй порт
+        port2_frame = ttk.Frame(ports_frame)
+        port2_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(port2_frame, text="Port 2:").pack(side=tk.LEFT)
+        self.port2_combo = ttk.Combobox(port2_frame, width=15)
+        self.port2_combo.pack(side=tk.LEFT)
+
+        # Общие настройки
+        settings_frame = ttk.Frame(left_panel)
+        settings_frame.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(settings_frame, text="Baud:").pack(side=tk.LEFT)
+        self.baud_combo = ttk.Combobox(settings_frame,
+                                       values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
                                        width=10)
         self.baud_combo.current(6)
         self.baud_combo.pack(side=tk.LEFT)
 
-        self.connect_btn = ttk.Button(left_panel, text="Connect", command=self.toggle_connection)
+        self.connect_btn = ttk.Button(settings_frame, text="Connect", command=self.toggle_connection)
         self.connect_btn.pack(side=tk.LEFT, padx=10)
 
         # Sample settings (removed rate entry since we get timestamps from Arduino)
-        ttk.Label(left_panel, text="Points:").pack(side=tk.LEFT)
-        self.points_entry = ttk.Entry(left_panel, width=8)
+        ttk.Label(settings_frame, text="Points:").pack(side=tk.LEFT)
+        self.points_entry = ttk.Entry(settings_frame, width=8)
         self.points_entry.insert(0, "1000")
         self.points_entry.pack(side=tk.LEFT)
 
         # Filter settings
-        ttk.Label(left_panel, text="Filter:").pack(side=tk.LEFT)
-        self.filter_combo = ttk.Combobox(left_panel, values=['None', 'LPF', 'HPF', 'BPF'], width=6)
+        ttk.Label(settings_frame, text="Filter:").pack(side=tk.LEFT)
+        self.filter_combo = ttk.Combobox(settings_frame, values=['None', 'LPF', 'HPF', 'BPF'], width=6)
         self.filter_combo.current(0)
         self.filter_combo.pack(side=tk.LEFT)
         self.filter_combo.bind("<<ComboboxSelected>>", self.update_filter_ui)
 
-        ttk.Label(left_panel, text="Order:").pack(side=tk.LEFT, padx=(10, 0))
-        self.filter_order_combo = ttk.Combobox(left_panel, values=[1, 2, 4], width=3)
+        ttk.Label(settings_frame, text="Order:").pack(side=tk.LEFT, padx=(10, 0))
+        self.filter_order_combo = ttk.Combobox(settings_frame, values=[1, 2, 4], width=3)
         self.filter_order_combo.current(0)
         self.filter_order_combo.pack(side=tk.LEFT)
 
-        self.std_cutoff_frame = ttk.Frame(left_panel)
+        self.std_cutoff_frame = ttk.Frame(settings_frame)
         self.std_cutoff_label = ttk.Label(self.std_cutoff_frame, text="Cutoff (Hz):")
         self.std_cutoff_label.pack(side=tk.LEFT)
         self.std_cutoff_entry = ttk.Entry(self.std_cutoff_frame, width=8)
@@ -176,7 +335,7 @@ class Oscilloscope:
         self.std_cutoff_entry.pack(side=tk.LEFT)
         self.std_cutoff_frame.pack(side=tk.LEFT)
 
-        self.bpf_cutoff_frame = ttk.Frame(left_panel)
+        self.bpf_cutoff_frame = ttk.Frame(settings_frame)
         self.bpf_low_label = ttk.Label(self.bpf_cutoff_frame, text="Low:")
         self.bpf_low_label.pack(side=tk.LEFT)
         self.bpf_low_entry = ttk.Entry(self.bpf_cutoff_frame, width=6)
@@ -288,12 +447,16 @@ class Oscilloscope:
 
     def setup_plots(self):
         time_frame = self.notebook.winfo_children()[0]
-        self.fig_time = plt.figure(figsize=(10, 8), dpi=100)
+        self.fig_time = plt.figure(figsize=(12, 10), dpi=100)
         self.axes = []
         self.lines = []
 
+        # Создаем 2 столбца по 5 графиков
         for i in range(self.num_channels):
-            ax = self.fig_time.add_subplot(self.num_channels, 1, i + 1)
+            # Определяем позицию подграфика (строка, столбец)
+            row = i % 5
+            col = i // 5
+            ax = self.fig_time.add_subplot(5, 2, i + 1)  # 5 строк, 2 столбца
             line, = ax.plot([], [], lw=1, color=self.channels[i]['color'])
             ax.set_ylabel(f'Ch {i + 1}')
             ax.grid(True)
@@ -307,17 +470,20 @@ class Oscilloscope:
                                      xytext=(5, -15 if i < self.num_channels - 1 else 5),
                                      textcoords='offset points',
                                      bbox=dict(boxstyle="round", fc="w", alpha=0.8),
-                                     arrowprops=dict(arrowstyle="->")
-                                     )
+                                     arrowprops=dict(arrowstyle="->"))
             annotation.set_visible(False)
             self.annotations.append(annotation)
 
         self.fig_time.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
         self.fig_time.canvas.mpl_connect('figure_leave_event', self.on_leave_figure)
 
-        self.axes[-1].set_xlabel('Time (seconds)')
+        # Устанавливаем подписи только для нижних графиков
+        for i in range(self.num_channels - 2, self.num_channels):
+            self.axes[i].set_xlabel('Time (seconds)')
+
         self.canvas_time = FigureCanvasTkAgg(self.fig_time, master=time_frame)
         self.canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.fig_time.tight_layout()
 
     def on_mouse_move(self, event):
         if event.inaxes is None:
@@ -363,9 +529,14 @@ class Oscilloscope:
 
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
-        self.port_combo['values'] = ports
+        self.port1_combo['values'] = ports
+        self.port2_combo['values'] = ports
         if ports:
-            self.port_combo.current(0)
+            self.port1_combo.current(0)
+            if len(ports) > 1:
+                self.port2_combo.current(1)
+            else:
+                self.port2_combo.current(0)
 
     def toggle_connection(self):
         if self.is_running:
@@ -376,8 +547,9 @@ class Oscilloscope:
     def toggle_pause(self):
         if self.paused:
             self._reset_measurement()
-            if self.ser and self.ser.is_open:
-                self.ser.reset_input_buffer()
+            for reader in self.serial_readers:
+                if reader.ser and reader.ser.is_open:
+                    reader.ser.reset_input_buffer()
             self.paused = False
             self.pause_btn.config(text="⏸ Stop")
         else:
@@ -403,83 +575,65 @@ class Oscilloscope:
 
     def start(self):
         try:
-            self.buffer = bytearray()
-            self.stop()
-            self.total_points = 0
+            self.stop()  # Гарантированно закрываем предыдущие соединения
 
-            for ch in self.channels:
-                ch['raw_data'].clear()
-                ch['filtered_data'].clear()
-                ch['timestamps'].clear()
-                ch['lpf_states'] = None
-                ch['hpf_states'] = None
-                ch['bpf_sections'] = None
+            # Сбрасываем все данные и состояния
+            self._reset_measurement()
 
-            self.ser = serial.Serial(
-                self.port_combo.get(),
-                int(self.baud_combo.get()),
-                timeout=0.01
-            )
-            self.ser.reset_input_buffer()
+            port1 = self.port1_combo.get()
+            port2 = self.port2_combo.get()
+            baudrate = int(self.baud_combo.get())
+
+            if not port1 or not port2:
+                messagebox.showerror("Error", "Please select both COM ports")
+                return
+
+            if port1 == port2:
+                messagebox.showerror("Error", "COM ports must be different")
+                return
+
+            print(f"\nStarting connection to {port1} and {port2} at {baudrate} baud")
+
+            # Создаем и запускаем оба читателя
+            self.serial_readers = [
+                SerialReader(port1, baudrate, self.data_queue, self.crc_calculator),
+                SerialReader(port2, baudrate, self.data_queue, self.crc_calculator)
+            ]
+
+            # Запускаем оба порта и проверяем результаты
+            connection_results = [reader.start() for reader in self.serial_readers]
+
+            if not any(connection_results):
+                messagebox.showerror("Error", "Failed to connect to any port")
+                return
+
+            # Показываем статус подключения
+            status_messages = []
+            for i, (reader, success) in enumerate(zip(self.serial_readers, connection_results)):
+                status = "connected" if success else "failed"
+                status_messages.append(f"Port {i + 1} ({reader.port}): {status}")
+
+            status_text = "\n".join(status_messages)
+            print(f"Connection status:\n{status_text}")
+            messagebox.showinfo("Connection Status", status_text)
+
             self.is_running = True
             self.paused = False
+            self.connect_btn.config(text="Disconnect")
             self.pause_btn.state(['!disabled'])
             self.export_btn.state(['!disabled'])
-            self.connect_btn.config(text="Disconnect")
 
-            for line in self.lines:
-                line.set_data([], [])
-            self.canvas_time.draw()
-
-            self.read_thread = threading.Thread(target=self.read_from_port, daemon=True)
-            self.read_thread.start()
+            # Запускаем обновление графиков
             self.update_plot()
+
+
         except Exception as e:
-            print("Error:", e)
-            messagebox.showerror("Connection Error", str(e))
 
-    def read_from_port(self):
-        PACKET_HEADER = 0xAA
-        PACKET_SIZE = 11  # 1(header) + 1(channel) + 4(time) + 4(value) + 1(CRC)
+            print(f"Start error: {str(e)}")
 
-        while self.is_running:
-            if self.ser and self.ser.in_waiting:
-                try:
-                    raw_data = self.ser.read(self.ser.in_waiting)
-                    self.buffer.extend(raw_data)
+            messagebox.showerror("Error", f"Failed to start: {str(e)}")
 
-                    while len(self.buffer) >= PACKET_SIZE:
-                        if self.buffer[0] != PACKET_HEADER:
-                            del self.buffer[0]
-                            continue
-
-                        packet = bytes(self.buffer[:PACKET_SIZE])
-
-                        # Проверяем CRC (первые 9 байт)
-                        computed_crc = self.crc_calculator.checksum(packet[:10])
-
-                        if computed_crc != packet[10]:
-                            print(f"CRC error: {computed_crc} != {packet[10]}")
-                            del self.buffer[0]
-                            continue
-
-                        # Извлекаем данные
-                        channel = packet[1]
-                        timestamp = struct.unpack('<f', packet[2:6])[0]
-
-                        # Значение - только 3 байта (6,7,8), так как 9-й байт - это CRC!
-                        value = struct.unpack('<f', packet[6:10])[0]
-
-                        #print(f"Raw packet: {[f'0x{b:02x}' for b in packet]}")
-                        #print(f"Value bytes (correct): {[f'0x{b:02x}' for b in packet[6:10]]}")
-                        #print(f"Received: channel={channel}, time={timestamp:.3f}, value={value}")
-
-                        self.data_queue.put((channel, timestamp, value))
-                        del self.buffer[:PACKET_SIZE]
-
-                except Exception as e:
-                    print(f"Error: {str(e)}")
-                    self.buffer.clear()
+            self.stop()  # Обязательно очищаем ресурсы при ошибке
 
     def apply_filter(self, value, channel_idx):
         filter_type = self.filter_combo.get()
@@ -592,56 +746,53 @@ class Oscilloscope:
                 max_points = 200
                 processed = 0
 
-                # Собираем новые данные из очереди
                 while not self.data_queue.empty() and processed < max_points:
-                    try:
-                        data = self.data_queue.get_nowait()
-                        if len(data) != 3:  # Проверяем структуру данных
-                            continue
+                    data = self.data_queue.get_nowait()
 
-                        channel_idx, timestamp, value = data
-                        channel_idx -= 1  # Каналы нумеруются с 1 в Arduino
+                    # Получаем данные из очереди
+                    port = data['port']
+                    channel_idx = data['channel'] - 1  # Каналы нумеруются с 1
+                    timestamp = data['timestamp']
+                    value = data['value']
 
-                        if 0 <= channel_idx < self.num_channels:
-                            ch = self.channels[channel_idx]
+                    if 0 <= channel_idx < self.num_channels:
+                        ch = self.channels[channel_idx]
+
+                        # Если порт для канала еще не назначен, назначаем его
+                        if 'port' not in ch or ch['port'] is None:
+                            ch['port'] = port
+                            print(f"Channel {channel_idx + 1} assigned to port {port}")
+
+                        # Добавляем данные только если они с правильного порта
+                        if ch['port'] == port:
                             ch['raw_data'].append(value)
                             ch['timestamps'].append(timestamp)
                             ch['filtered_data'].append(self.apply_filter(value, channel_idx))
                             processed += 1
-                    except Exception as e:
-                        print(f"Error processing data: {e}")
+                        else:
+                            print(f"Ignored data for channel {channel_idx + 1} from {port} (expected {ch['port']})")
+
+                # Обновляем графики
+                points_to_show = int(self.points_entry.get())
+
+                for i, (ax, line, ch) in enumerate(zip(self.axes, self.lines, self.channels)):
+                    if len(ch['timestamps']) == 0:
                         continue
 
-                # Определяем сколько точек показывать
-                try:
-                    points_to_show = int(self.points_entry.get())
-                except ValueError:
-                    points_to_show = 1000  # Значение по умолчанию
-
-                for i, ax in enumerate(self.axes):
-                    ch = self.channels[i]
-
-                    # Преобразуем в numpy array перед срезом
                     time_array = np.array(ch['timestamps'])
                     data_array = np.array(ch['filtered_data'])
 
-                    # Берем последние N точек
                     start_idx = max(0, len(time_array) - points_to_show)
                     time_axis = time_array[start_idx:]
                     data_axis = data_array[start_idx:]
 
-                    # Обновляем данные на графике
-                    self.lines[i].set_data(time_axis, data_axis)
+                    line.set_data(time_axis, data_axis)
 
-                    # Настраиваем масштаб
                     if len(time_axis) > 1:
                         ax.relim()
-                        ax.autoscale_view(scalex=True, scaley=True)
-
-                        # Устанавливаем пределы по X
+                        ax.autoscale_view()
                         ax.set_xlim(time_axis[0], time_axis[-1])
 
-                        # Добавляем небольшой отступ по Y
                         y_min, y_max = np.min(data_axis), np.max(data_axis)
                         y_margin = max(0.1 * (y_max - y_min), 0.5)
                         ax.set_ylim(y_min - y_margin, y_max + y_margin)
@@ -649,9 +800,7 @@ class Oscilloscope:
                 self.canvas_time.draw()
 
             except Exception as e:
-                print(f"Update error: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"Plot update error: {str(e)}")
 
         self.after_id = self.master.after(20, self.update_plot)
 
@@ -760,39 +909,32 @@ class Oscilloscope:
             messagebox.showerror("Export Error", f"Failed to export data:\n{str(e)}")
 
     def stop(self):
-        if self.is_running or self.ser is not None:
-            self.is_running = False
+        print("\nStopping application...")
 
-            if self.after_id:
+        # Останавливаем обновление графиков
+        if self.after_id:
+            try:
                 self.master.after_cancel(self.after_id)
-                self.after_id = None
+            except:
+                pass
+            self.after_id = None
 
-            if self.ser and self.ser.is_open:
+        # Останавливаем все SerialReader'ы
+        if hasattr(self, 'serial_readers'):
+            for reader in self.serial_readers:
                 try:
-                    self.ser.close()
-                    print("COM port closed successfully")
-                except serial.SerialException as e:
-                    print(f"Error closing port: {str(e)}")
-                finally:
-                    self.ser = None
-
-            if hasattr(self, 'read_thread'):
-                try:
-                    self.read_thread.join(timeout=0.5)
-                    if self.read_thread.is_alive():
-                        print("Warning: Read thread not terminated properly")
+                    reader.stop()
                 except Exception as e:
-                    print(f"Thread join error: {str(e)}")
+                    print(f"Error stopping reader: {str(e)}")
+            self.serial_readers = []
 
-            self.connect_btn.config(text="Connect")
-            self.pause_btn.state(['disabled'])
-            self.export_btn.state(['disabled'])
+        # Обновляем интерфейс
+        self.is_running = False
+        self.connect_btn.config(text="Connect")
+        self.pause_btn.state(['disabled'])
+        self.export_btn.state(['disabled'])
 
-        self.data_queue.queue.clear()
-        for ch in self.channels:
-            ch['raw_data'].clear()
-            ch['filtered_data'].clear()
-            ch['timestamps'].clear()
+        print("Application stopped successfully")
 
 
 if __name__ == "__main__":
