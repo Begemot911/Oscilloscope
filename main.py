@@ -156,8 +156,8 @@ class Oscilloscope:
         self.channels = []
 
         # Цвета для 10 каналов
-        colors = ['blue', 'green', 'red', 'purple', 'orange',
-                  'cyan', 'magenta', 'yellow', 'brown', 'pink']
+        colors = ['blue', 'green', 'red', 'purple', 'darkorange',
+                  'navy', 'magenta', 'darkorange', 'brown', 'pink']
 
         for i in range(self.num_channels):
             self.channels.append({
@@ -506,7 +506,7 @@ class Oscilloscope:
                 y = ydata[idx]
 
                 self.annotations[i].xy = (x, y)
-                self.annotations[i].set_text(f'x={x:.2f}s, y={y:.2f}mV')
+                self.annotations[i].set_text(f'x={x:.2f}s, y={y:.2f}')
                 self.annotations[i].set_visible(True)
             else:
                 self.annotations[i].set_visible(False)
@@ -529,14 +529,13 @@ class Oscilloscope:
 
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
-        self.port1_combo['values'] = ports
-        self.port2_combo['values'] = ports
-        if ports:
-            self.port1_combo.current(0)
-            if len(ports) > 1:
-                self.port2_combo.current(1)
-            else:
-                self.port2_combo.current(0)
+        # Добавляем "None" в начало списка
+        self.port1_combo['values'] = ["None"] + ports
+        self.port2_combo['values'] = ["None"] + ports
+
+
+        self.port1_combo.current(1)
+        self.port2_combo.current(0)
 
     def toggle_connection(self):
         if self.is_running:
@@ -608,14 +607,14 @@ class Oscilloscope:
                 return
 
             # Показываем статус подключения
-            status_messages = []
+            '''status_messages = []
             for i, (reader, success) in enumerate(zip(self.serial_readers, connection_results)):
                 status = "connected" if success else "failed"
                 status_messages.append(f"Port {i + 1} ({reader.port}): {status}")
 
             status_text = "\n".join(status_messages)
             print(f"Connection status:\n{status_text}")
-            messagebox.showinfo("Connection Status", status_text)
+            messagebox.showinfo("Connection Status", status_text)'''
 
             self.is_running = True
             self.paused = False
