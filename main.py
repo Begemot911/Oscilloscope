@@ -1,5 +1,4 @@
 import matplotlib
-
 matplotlib.use('TkAgg')
 from matplotlib.backend_bases import MouseEvent
 import tkinter as tk
@@ -15,8 +14,6 @@ import pandas as pd
 import queue
 import threading
 import struct
-import neurokit2 as nk
-from scipy.signal import find_peaks
 from crc import Calculator, Crc8
 
 
@@ -30,7 +27,7 @@ class SerialReader:
         self.is_running = False
         self.thread = None
         self.buffer = bytearray()
-        self.lock = threading.Lock()  # Добавляем блокировку для безопасного доступа
+        self.lock = threading.Lock()
 
     def start(self):
         if self.is_running:
@@ -61,7 +58,6 @@ class SerialReader:
 
         while self.is_running and self.ser and self.ser.is_open:
             try:
-                # Читаем все доступные данные
                 bytes_to_read = self.ser.in_waiting
                 if bytes_to_read == 0:
                     time.sleep(0.01)
@@ -70,41 +66,34 @@ class SerialReader:
                 raw_data = self.ser.read(bytes_to_read)
                 self.buffer.extend(raw_data)
 
-                # Обрабатываем все полные пакеты в буфере
                 while len(self.buffer) >= PACKET_SIZE:
-                    # Ищем начало пакета
                     header_pos = -1
                     for i in range(len(self.buffer) - PACKET_SIZE + 1):
                         if self.buffer[i] == PACKET_HEADER:
                             header_pos = i
                             break
 
-                    # Если заголовок не найден, очищаем буфер
                     if header_pos == -1:
                         self.buffer.clear()
                         break
 
-                    # Если заголовок не в начале, удаляем мусорные данные
                     if header_pos > 0:
                         print(f"{self.port}: Discarded {header_pos} bytes before header")
                         del self.buffer[:header_pos]
                         continue
 
-                    # Проверяем CRC
                     packet = bytes(self.buffer[:PACKET_SIZE])
                     computed_crc = self.crc_calculator.checksum(packet[:10])
 
                     if computed_crc != packet[10]:
                         print(f"{self.port}: CRC error, skipping packet")
-                        del self.buffer[:1]  # Пропускаем только 1 байт
+                        del self.buffer[:1]
                         continue
 
-                    # Извлекаем данные
                     channel = packet[1]
                     timestamp = struct.unpack('<f', packet[2:6])[0]
                     value = struct.unpack('<f', packet[6:10])[0]
 
-                    # Помещаем в очередь
                     self.data_queue.put({
                         'port': self.port,
                         'channel': channel,
@@ -112,7 +101,6 @@ class SerialReader:
                         'value': value
                     })
 
-                    # Удаляем обработанный пакет
                     del self.buffer[:PACKET_SIZE]
 
             except serial.SerialException as e:
@@ -129,7 +117,7 @@ class SerialReader:
             self.is_running = False
 
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)  # Ожидаем завершение потока
+            self.thread.join(timeout=1.0)
 
         if self.ser and self.ser.is_open:
             try:
@@ -147,17 +135,16 @@ class Oscilloscope:
         self.crc_calculator = Calculator(Crc8.CCITT)
         self.after_id = None
         self.master = master
-        self.serial_readers = []  # Список для хранения объектов SerialReader
+        self.serial_readers = []
         self.is_running = False
         self.paused = False
         self.buffer_size = 5000
         self.total_points = 0
-        self.num_channels = 10  # Теперь 10 каналов
+        self.num_channels = 10
         self.channels = []
 
-        # Цвета для 10 каналов
         colors = ['blue', 'green', 'red', 'purple', 'darkorange',
-                  'navy', 'magenta', 'darkorange', 'brown', 'pink']
+                 'navy', 'magenta', 'darkorange', 'brown', 'pink']
 
         for i in range(self.num_channels):
             self.channels.append({
@@ -189,9 +176,7 @@ class Oscilloscope:
 
     def on_close(self):
         print("Closing application...")
-        self.stop()  # Гарантированно останавливаем все процессы
-
-        # Дополнительная очистка, если нужна
+        self.stop()
         try:
             self.data_queue.queue.clear()
             for ch in self.channels:
@@ -200,23 +185,19 @@ class Oscilloscope:
                 ch['timestamps'].clear()
         except:
             pass
-
-        self.master.destroy()  # Закрываем окно
+        self.master.destroy()
         print("Application closed")
 
     def setup_gui(self):
         main_panel = ttk.PanedWindow(self.master, orient=tk.HORIZONTAL)
         main_panel.pack(fill=tk.BOTH, expand=True)
 
-        # Левая панель с информацией о пациенте
         left_info_panel = ttk.Frame(main_panel, width=250)
         main_panel.add(left_info_panel)
 
-        # Правая панель с графиками и управлением
         right_panel = ttk.Frame(main_panel)
         main_panel.add(right_panel)
 
-        # Информация о пациенте
         patient_frame = ttk.LabelFrame(left_info_panel, text="Информация о пациенте")
         patient_frame.pack(padx=10, pady=10, fill=tk.X)
 
@@ -244,11 +225,6 @@ class Oscilloscope:
         self.diagnosis_entry = ttk.Entry(patient_frame)
         self.diagnosis_entry.grid(row=5, column=1, sticky=tk.EW, padx=5, pady=2)
 
-        # Кнопка анализа ЭКГ
-        self.analyze_btn = ttk.Button(left_info_panel, text="Анализ ЭКГ", command=self.analyze_ecg)
-        self.analyze_btn.pack(pady=10, fill=tk.X)
-
-        # Добавляем текстовое поле для результатов
         results_frame = ttk.LabelFrame(left_info_panel, text="Результаты анализа")
         results_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
@@ -259,15 +235,12 @@ class Oscilloscope:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.result_text.pack(fill=tk.BOTH, expand=False)
 
-        # Переносим остальные элементы управления в правую панель
         self.notebook = ttk.Notebook(right_panel)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Time Domain Tab
         time_frame = ttk.Frame(self.notebook)
         self.notebook.add(time_frame, text='Oscilloscope')
 
-        # Control Panel
         control_frame = ttk.Frame(time_frame)
         control_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
@@ -277,45 +250,39 @@ class Oscilloscope:
         right_panel = ttk.Frame(control_frame)
         right_panel.pack(side=tk.RIGHT)
 
-        # Port settings - теперь для двух портов
         ports_frame = ttk.Frame(left_panel)
         ports_frame.pack(side=tk.TOP, fill=tk.X)
 
-        # Первый порт
         port1_frame = ttk.Frame(ports_frame)
         port1_frame.pack(side=tk.LEFT, padx=5)
         ttk.Label(port1_frame, text="Port 1:").pack(side=tk.LEFT)
         self.port1_combo = ttk.Combobox(port1_frame, width=15)
         self.port1_combo.pack(side=tk.LEFT)
 
-        # Второй порт
         port2_frame = ttk.Frame(ports_frame)
         port2_frame.pack(side=tk.LEFT, padx=5)
         ttk.Label(port2_frame, text="Port 2:").pack(side=tk.LEFT)
         self.port2_combo = ttk.Combobox(port2_frame, width=15)
         self.port2_combo.pack(side=tk.LEFT)
 
-        # Общие настройки
         settings_frame = ttk.Frame(left_panel)
         settings_frame.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(settings_frame, text="Baud:").pack(side=tk.LEFT)
         self.baud_combo = ttk.Combobox(settings_frame,
-                                       values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
-                                       width=10)
+                                      values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
+                                      width=10)
         self.baud_combo.current(6)
         self.baud_combo.pack(side=tk.LEFT)
 
         self.connect_btn = ttk.Button(settings_frame, text="Connect", command=self.toggle_connection)
         self.connect_btn.pack(side=tk.LEFT, padx=10)
 
-        # Sample settings (removed rate entry since we get timestamps from Arduino)
         ttk.Label(settings_frame, text="Points:").pack(side=tk.LEFT)
         self.points_entry = ttk.Entry(settings_frame, width=8)
         self.points_entry.insert(0, "1000")
         self.points_entry.pack(side=tk.LEFT)
 
-        # Filter settings
         ttk.Label(settings_frame, text="Filter:").pack(side=tk.LEFT)
         self.filter_combo = ttk.Combobox(settings_frame, values=['None', 'LPF', 'HPF', 'BPF'], width=6)
         self.filter_combo.current(0)
@@ -348,7 +315,6 @@ class Oscilloscope:
         self.bpf_high_entry.pack(side=tk.LEFT)
         self.bpf_cutoff_frame.pack_forget()
 
-        # Buttons
         self.export_btn = ttk.Button(right_panel, text="📤 Export", command=self.export_data)
         self.export_btn.pack(side=tk.RIGHT, padx=5)
         self.export_btn.state(['disabled'])
@@ -357,106 +323,16 @@ class Oscilloscope:
         self.pause_btn.pack(side=tk.RIGHT, padx=5)
         self.pause_btn.state(['disabled'])
 
-    def analyze_ecg(self):
-        """Анализ ЭКГ сигнала с корректной визуализацией"""
-        plt.close('all')
-
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv")],
-            title="Выберите файл с ЭКГ данными"
-        )
-
-        if not file_path:
-            return
-
-        try:
-            df = pd.read_excel(file_path)
-
-            required_columns = ['Time (s)', 'Ch1_Filtered']
-            if not all(col in df.columns for col in required_columns):
-                missing = [col for col in required_columns if col not in df.columns]
-                messagebox.showerror("Ошибка", f"Отсутствуют необходимые столбцы: {', '.join(missing)}")
-                return
-
-            time_data = df['Time (s)'].values
-            ecg_signal = df['Ch1_Filtered'].values
-
-            min_length = 250
-            if len(ecg_signal) < min_length:
-                messagebox.showwarning("Предупреждение",
-                                       f"Слишком короткая запись ЭКГ. Минимум {min_length} точек, получено {len(ecg_signal)}")
-                return
-
-            # Calculate sampling rate from timestamps
-            if len(time_data) > 1:
-                sampling_rate = 1 / np.mean(np.diff(time_data))
-            else:
-                sampling_rate = 250
-
-            ecg_filtered = nk.ecg_clean(ecg_signal, sampling_rate=sampling_rate)
-
-            try:
-                _, rpeaks = nk.ecg_peaks(ecg_filtered, sampling_rate=sampling_rate)
-                peaks = rpeaks['ECG_R_Peaks']
-
-                if len(peaks) < 2:
-                    messagebox.showwarning("Предупреждение",
-                                           f"Обнаружено только {len(peaks)} R-пиков. Необходимо минимум 2 для анализа.")
-                    return
-            except Exception as e:
-                messagebox.showerror("Ошибка детекции", f"Не удалось обнаружить R-пики: {str(e)}")
-                return
-
-            rr_intervals = np.diff(peaks) / sampling_rate
-            heart_rate = 60 / np.mean(rr_intervals)
-
-            result_text = (
-                "=== Результаты анализа ЭКГ ===\n\n"
-                f"Длительность записи: {time_data[-1] - time_data[0]:.1f} сек\n"
-                f"Частота дискретизации: {sampling_rate:.1f} Гц\n"
-                f"Общее количество точек: {len(ecg_signal)}\n"
-                f"Обнаружено R-пиков: {len(peaks)}\n"
-                f"Средняя ЧСС: {heart_rate:.1f} уд/мин\n"
-                f"Диапазон ЧСС: {60 / rr_intervals.max():.1f}-{60 / rr_intervals.min():.1f} уд/мин\n\n"
-            )
-
-            if np.std(rr_intervals) > 0.1:
-                result_text += "ВНИМАНИЕ: Обнаружена возможная аритмия (высокая вариабельность RR-интервалов)\n"
-
-            self.result_text.delete(1.0, tk.END)
-            self.result_text.insert(tk.END, result_text)
-
-            ecg_fig = plt.figure("Анализ ЭКГ", figsize=(12, 6))
-
-            ax = ecg_fig.add_subplot(111)
-            ax.plot(time_data, ecg_filtered, label='Фильтрованный ЭКГ сигнал')
-            ax.scatter(time_data[peaks], ecg_filtered[peaks], color='red', label='R-пики')
-
-            ax.set_title(f"ЭКГ анализ (ЧСС: {heart_rate:.1f} уд/мин)")
-            ax.set_xlabel("Время (с)")
-            ax.set_ylabel("Амплитуда")
-            ax.legend()
-            ax.grid(True)
-
-            plt.tight_layout()
-            plt.show()
-
-        except Exception as e:
-            messagebox.showerror("Ошибка анализа", f"Не удалось проанализировать ЭКГ:\n{str(e)}")
-            plt.close('all')
-
     def setup_plots(self):
         time_frame = self.notebook.winfo_children()[0]
         self.fig_time = plt.figure(figsize=(12, 10), dpi=100)
         self.axes = []
         self.lines = []
 
-        # Создаем 2 столбца по 5 графиков
         for i in range(self.num_channels):
-            # Определяем позицию подграфика (строка, столбец)
             row = i % 5
             col = i // 5
-            ax = self.fig_time.add_subplot(5, 2, i + 1)  # 5 строк, 2 столбца
+            ax = self.fig_time.add_subplot(5, 2, i + 1)
             line, = ax.plot([], [], lw=1, color=self.channels[i]['color'])
             ax.set_ylabel(f'Ch {i + 1}')
             ax.grid(True)
@@ -466,18 +342,17 @@ class Oscilloscope:
         self.annotations = []
         for i, ax in enumerate(self.axes):
             annotation = ax.annotate('',
-                                     xy=(0, 0),
-                                     xytext=(5, -15 if i < self.num_channels - 1 else 5),
-                                     textcoords='offset points',
-                                     bbox=dict(boxstyle="round", fc="w", alpha=0.8),
-                                     arrowprops=dict(arrowstyle="->"))
+                                   xy=(0, 0),
+                                   xytext=(5, -15 if i < self.num_channels - 1 else 5),
+                                   textcoords='offset points',
+                                   bbox=dict(boxstyle="round", fc="w", alpha=0.8),
+                                   arrowprops=dict(arrowstyle="->"))
             annotation.set_visible(False)
             self.annotations.append(annotation)
 
         self.fig_time.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
         self.fig_time.canvas.mpl_connect('figure_leave_event', self.on_leave_figure)
 
-        # Устанавливаем подписи только для нижних графиков
         for i in range(self.num_channels - 2, self.num_channels):
             self.axes[i].set_xlabel('Time (seconds)')
 
@@ -529,11 +404,8 @@ class Oscilloscope:
 
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
-        # Добавляем "None" в начало списка
         self.port1_combo['values'] = ["None"] + ports
         self.port2_combo['values'] = ["None"] + ports
-
-
         self.port1_combo.current(1)
         self.port2_combo.current(0)
 
@@ -574,9 +446,8 @@ class Oscilloscope:
 
     def start(self):
         try:
-            self.stop()  # Гарантированно закрываем предыдущие соединения
+            self.stop()
 
-            # Сбрасываем все данные и состояния
             self._reset_measurement()
 
             port1 = self.port1_combo.get()
@@ -593,28 +464,16 @@ class Oscilloscope:
 
             print(f"\nStarting connection to {port1} and {port2} at {baudrate} baud")
 
-            # Создаем и запускаем оба читателя
             self.serial_readers = [
                 SerialReader(port1, baudrate, self.data_queue, self.crc_calculator),
                 SerialReader(port2, baudrate, self.data_queue, self.crc_calculator)
             ]
 
-            # Запускаем оба порта и проверяем результаты
             connection_results = [reader.start() for reader in self.serial_readers]
 
             if not any(connection_results):
                 messagebox.showerror("Error", "Failed to connect to any port")
                 return
-
-            # Показываем статус подключения
-            '''status_messages = []
-            for i, (reader, success) in enumerate(zip(self.serial_readers, connection_results)):
-                status = "connected" if success else "failed"
-                status_messages.append(f"Port {i + 1} ({reader.port}): {status}")
-
-            status_text = "\n".join(status_messages)
-            print(f"Connection status:\n{status_text}")
-            messagebox.showinfo("Connection Status", status_text)'''
 
             self.is_running = True
             self.paused = False
@@ -622,17 +481,12 @@ class Oscilloscope:
             self.pause_btn.state(['!disabled'])
             self.export_btn.state(['!disabled'])
 
-            # Запускаем обновление графиков
             self.update_plot()
 
-
         except Exception as e:
-
             print(f"Start error: {str(e)}")
-
             messagebox.showerror("Error", f"Failed to start: {str(e)}")
-
-            self.stop()  # Обязательно очищаем ресурсы при ошибке
+            self.stop()
 
     def apply_filter(self, value, channel_idx):
         filter_type = self.filter_combo.get()
@@ -649,7 +503,6 @@ class Oscilloscope:
             except:
                 cutoff = 50.0
 
-            # Calculate alpha based on time difference from previous sample
             if len(ch['timestamps']) > 0:
                 time_diff = ch['timestamps'][-1] - ch['timestamps'][-2] if len(ch['timestamps']) > 1 else 0.001
                 if time_diff <= 0:
@@ -748,21 +601,18 @@ class Oscilloscope:
                 while not self.data_queue.empty() and processed < max_points:
                     data = self.data_queue.get_nowait()
 
-                    # Получаем данные из очереди
                     port = data['port']
-                    channel_idx = data['channel'] - 1  # Каналы нумеруются с 1
+                    channel_idx = data['channel'] - 1
                     timestamp = data['timestamp']
                     value = data['value']
 
                     if 0 <= channel_idx < self.num_channels:
                         ch = self.channels[channel_idx]
 
-                        # Если порт для канала еще не назначен, назначаем его
                         if 'port' not in ch or ch['port'] is None:
                             ch['port'] = port
                             print(f"Channel {channel_idx + 1} assigned to port {port}")
 
-                        # Добавляем данные только если они с правильного порта
                         if ch['port'] == port:
                             ch['raw_data'].append(value)
                             ch['timestamps'].append(timestamp)
@@ -771,7 +621,6 @@ class Oscilloscope:
                         else:
                             print(f"Ignored data for channel {channel_idx + 1} from {port} (expected {ch['port']})")
 
-                # Обновляем графики
                 points_to_show = int(self.points_entry.get())
 
                 for i, (ax, line, ch) in enumerate(zip(self.axes, self.lines, self.channels)):
@@ -837,15 +686,13 @@ class Oscilloscope:
                 messagebox.showerror("Error", "Invalid points value! Please enter a positive integer.")
                 return
 
-            # Find the minimum available points across all channels
             points_available = min(points_to_save,
-                                   min(len(ch['timestamps']) for ch in self.channels if len(ch['timestamps']) > 0))
+                                 min(len(ch['timestamps']) for ch in self.channels if len(ch['timestamps']) > 0))
 
             if points_available == 0:
                 messagebox.showwarning("No Data", "There is no data to export.")
                 return
 
-            # Create a DataFrame with timestamps and data for each channel
             data_dict = {}
             for i, ch in enumerate(self.channels):
                 if len(ch['timestamps']) > 0:
@@ -871,13 +718,13 @@ class Oscilloscope:
                 try:
                     with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
                         df_info.to_excel(writer,
-                                         sheet_name='Patient Info',
-                                         index=False,
-                                         header=['Parameter', 'Value'])
+                                       sheet_name='Patient Info',
+                                       index=False,
+                                       header=['Parameter', 'Value'])
 
                         df_data.to_excel(writer,
-                                         sheet_name='Measurement Data',
-                                         index=False)
+                                       sheet_name='Measurement Data',
+                                       index=False)
 
                         from openpyxl.utils import get_column_letter
 
@@ -910,7 +757,6 @@ class Oscilloscope:
     def stop(self):
         print("\nStopping application...")
 
-        # Останавливаем обновление графиков
         if self.after_id:
             try:
                 self.master.after_cancel(self.after_id)
@@ -918,7 +764,6 @@ class Oscilloscope:
                 pass
             self.after_id = None
 
-        # Останавливаем все SerialReader'ы
         if hasattr(self, 'serial_readers'):
             for reader in self.serial_readers:
                 try:
@@ -927,7 +772,6 @@ class Oscilloscope:
                     print(f"Error stopping reader: {str(e)}")
             self.serial_readers = []
 
-        # Обновляем интерфейс
         self.is_running = False
         self.connect_btn.config(text="Connect")
         self.pause_btn.state(['disabled'])
