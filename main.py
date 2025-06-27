@@ -1,4 +1,5 @@
 import matplotlib
+
 matplotlib.use('TkAgg')
 from matplotlib.backend_bases import MouseEvent
 import tkinter as tk
@@ -112,6 +113,17 @@ class SerialReader:
 
         print(f"Stopped reading from {self.port}")
 
+    def send_command(self, command):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(command.encode('utf-8'))
+                self.ser.flush()
+                print(f"Sent command '{command}' to {self.port}")
+                return True
+            except Exception as e:
+                print(f"Failed to send command to {self.port}: {str(e)}")
+        return False
+
     def stop(self):
         with self.lock:
             self.is_running = False
@@ -144,7 +156,7 @@ class Oscilloscope:
         self.channels = []
 
         colors = ['blue', 'green', 'red', 'purple', 'darkorange',
-                 'navy', 'magenta', 'darkorange', 'brown', 'pink']
+                  'navy', 'magenta', 'darkorange', 'brown', 'pink']
 
         for i in range(self.num_channels):
             self.channels.append({
@@ -253,25 +265,26 @@ class Oscilloscope:
         ports_frame = ttk.Frame(left_panel)
         ports_frame.pack(side=tk.TOP, fill=tk.X)
 
-        port1_frame = ttk.Frame(ports_frame)
-        port1_frame.pack(side=tk.LEFT, padx=5)
-        ttk.Label(port1_frame, text="Port 1:").pack(side=tk.LEFT)
-        self.port1_combo = ttk.Combobox(port1_frame, width=15)
-        self.port1_combo.pack(side=tk.LEFT)
+        # Создаем фреймы для каждого порта
+        port_frames = []
+        for i in range(6):
+            port_frame = ttk.Frame(ports_frame)
+            port_frame.pack(side=tk.LEFT, padx=2)
+            ttk.Label(port_frame, text=f"Port {i + 1}:").pack(side=tk.LEFT)
+            combo = ttk.Combobox(port_frame, width=12)
+            combo.pack(side=tk.LEFT)
+            port_frames.append(combo)
 
-        port2_frame = ttk.Frame(ports_frame)
-        port2_frame.pack(side=tk.LEFT, padx=5)
-        ttk.Label(port2_frame, text="Port 2:").pack(side=tk.LEFT)
-        self.port2_combo = ttk.Combobox(port2_frame, width=15)
-        self.port2_combo.pack(side=tk.LEFT)
+        # Сохраняем ссылки на комбобоксы
+        self.port1_combo, self.port2_combo, self.port3_combo, self.port4_combo, self.port5_combo, self.port6_combo = port_frames
 
         settings_frame = ttk.Frame(left_panel)
         settings_frame.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(settings_frame, text="Baud:").pack(side=tk.LEFT)
         self.baud_combo = ttk.Combobox(settings_frame,
-                                      values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
-                                      width=10)
+                                       values=[9600, 19200, 38400, 57600, 115200, 250000, 500000, 1000000],
+                                       width=10)
         self.baud_combo.current(6)
         self.baud_combo.pack(side=tk.LEFT)
 
@@ -342,11 +355,11 @@ class Oscilloscope:
         self.annotations = []
         for i, ax in enumerate(self.axes):
             annotation = ax.annotate('',
-                                   xy=(0, 0),
-                                   xytext=(5, -15 if i < self.num_channels - 1 else 5),
-                                   textcoords='offset points',
-                                   bbox=dict(boxstyle="round", fc="w", alpha=0.8),
-                                   arrowprops=dict(arrowstyle="->"))
+                                     xy=(0, 0),
+                                     xytext=(5, -15 if i < self.num_channels - 1 else 5),
+                                     textcoords='offset points',
+                                     bbox=dict(boxstyle="round", fc="w", alpha=0.8),
+                                     arrowprops=dict(arrowstyle="->"))
             annotation.set_visible(False)
             self.annotations.append(annotation)
 
@@ -404,10 +417,37 @@ class Oscilloscope:
 
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
-        self.port1_combo['values'] = ["None"] + ports
-        self.port2_combo['values'] = ["None"] + ports
-        self.port1_combo.current(1)
-        self.port2_combo.current(0)
+        port_values = ["None"] + ports
+        for combo in [self.port1_combo, self.port2_combo, self.port3_combo,
+                      self.port4_combo, self.port5_combo, self.port6_combo]:
+            combo['values'] = port_values
+            combo.current(0)
+        self.port1_combo.current(1 if len(ports) > 0 else 0)
+        self.port2_combo.current(2 if len(ports) > 1 else 0)
+
+    def send_start_command(self):
+        """Отправляет команду 'start' на все подключенные порты"""
+        if not self.serial_readers:
+            return False
+
+        results = []
+        for reader in self.serial_readers:
+            if reader.is_running and reader.ser and reader.ser.is_open:
+                results.append(reader.send_command("start"))
+
+        return any(results)
+
+    def send_stop_command(self):
+        """Отправляет команду 'stop' на все подключенные порты"""
+        if not self.serial_readers:
+            return False
+
+        results = []
+        for reader in self.serial_readers:
+            if reader.is_running and reader.ser and reader.ser.is_open:
+                results.append(reader.send_command("stop"))
+
+        return any(results)
 
     def toggle_connection(self):
         if self.is_running:
@@ -417,13 +457,18 @@ class Oscilloscope:
 
     def toggle_pause(self):
         if self.paused:
+            # При возобновлении измерений
             self._reset_measurement()
             for reader in self.serial_readers:
                 if reader.ser and reader.ser.is_open:
                     reader.ser.reset_input_buffer()
             self.paused = False
             self.pause_btn.config(text="⏸ Stop")
+            # Отправляем команду start при возобновлении
+            self.send_start_command()
         else:
+            # При остановке измерений
+            self.send_stop_command()
             self.paused = True
             self.pause_time = time.time()
             self.pause_btn.config(text="▶ Start")
@@ -450,23 +495,34 @@ class Oscilloscope:
 
             self._reset_measurement()
 
-            port1 = self.port1_combo.get()
-            port2 = self.port2_combo.get()
+            ports = [
+                self.port1_combo.get(),
+                self.port2_combo.get(),
+                self.port3_combo.get(),
+                self.port4_combo.get(),
+                self.port5_combo.get(),
+                self.port6_combo.get()
+            ]
+
+            # Фильтруем только выбранные порты (не "None")
+            selected_ports = [port for port in ports if port and port != "None"]
+
+            if not selected_ports:
+                messagebox.showerror("Error", "Please select at least one COM port")
+                return
+
+            # Проверяем на дубликаты портов
+            if len(selected_ports) != len(set(selected_ports)):
+                messagebox.showerror("Error", "COM ports must be unique")
+                return
+
             baudrate = int(self.baud_combo.get())
 
-            if not port1 or not port2:
-                messagebox.showerror("Error", "Please select both COM ports")
-                return
-
-            if port1 == port2:
-                messagebox.showerror("Error", "COM ports must be different")
-                return
-
-            print(f"\nStarting connection to {port1} and {port2} at {baudrate} baud")
+            print(f"\nStarting connection to ports: {', '.join(selected_ports)} at {baudrate} baud")
 
             self.serial_readers = [
-                SerialReader(port1, baudrate, self.data_queue, self.crc_calculator),
-                SerialReader(port2, baudrate, self.data_queue, self.crc_calculator)
+                SerialReader(port, baudrate, self.data_queue, self.crc_calculator)
+                for port in selected_ports
             ]
 
             connection_results = [reader.start() for reader in self.serial_readers]
@@ -474,6 +530,10 @@ class Oscilloscope:
             if not any(connection_results):
                 messagebox.showerror("Error", "Failed to connect to any port")
                 return
+
+            # Отправляем команду start после успешного подключения
+            if not self.send_start_command():
+                print("Warning: Failed to send start command to some ports")
 
             self.is_running = True
             self.paused = False
@@ -687,7 +747,7 @@ class Oscilloscope:
                 return
 
             points_available = min(points_to_save,
-                                 min(len(ch['timestamps']) for ch in self.channels if len(ch['timestamps']) > 0))
+                                   min(len(ch['timestamps']) for ch in self.channels if len(ch['timestamps']) > 0))
 
             if points_available == 0:
                 messagebox.showwarning("No Data", "There is no data to export.")
@@ -718,13 +778,13 @@ class Oscilloscope:
                 try:
                     with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
                         df_info.to_excel(writer,
-                                       sheet_name='Patient Info',
-                                       index=False,
-                                       header=['Parameter', 'Value'])
+                                         sheet_name='Patient Info',
+                                         index=False,
+                                         header=['Parameter', 'Value'])
 
                         df_data.to_excel(writer,
-                                       sheet_name='Measurement Data',
-                                       index=False)
+                                         sheet_name='Measurement Data',
+                                         index=False)
 
                         from openpyxl.utils import get_column_letter
 
@@ -756,6 +816,9 @@ class Oscilloscope:
 
     def stop(self):
         print("\nStopping application...")
+
+        # Отправляем команду stop перед отключением
+        self.send_stop_command()
 
         if self.after_id:
             try:
